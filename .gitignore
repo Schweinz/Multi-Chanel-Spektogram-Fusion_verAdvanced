@@ -1,0 +1,30 @@
+# Dokumen - JANGAN PERNAH PUSH
+*.docx
+*.doc
+*.pdf
+*.odt
+*.pptx
+*.ppt
+
+# Data besar
+*.npz
+*.npy
+*.h5
+*.keras
+*.pkl
+
+# Direktori data
+spectrograms/
+enhanced_spectrograms/
+fused_dataset/
+models/
+results/
+ravdess_data/
+ser_advanced_local/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Log
+*.log
+*.csv
