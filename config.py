@@ -1,15 +1,17 @@
 """
 config.py
 =========
-Pusat konfigurasi untuk pipeline versi Advanced.
+Pusat konfigurasi untuk pipeline versi Advanced (Opsi C).
 
-Perubahan dari versi sebelumnya (MobileNetV2):
-  - Backbone diganti EfficientNetB0
-  - Ditambahkan SE Block (Squeeze-and-Excitation attention)
-  - Ditambahkan SpecAugment (augmentasi frekuensi dan waktu)
+Arsitektur: ResNet50V2 + SE Block + BiGRU + SpecAugment
+Input: 224×224 (ukuran optimal untuk ResNet50V2 pretrained ImageNet)
 
-Kalau mau eksperimen, ubah nilai di sini saja — tidak perlu
-buka file step1 sampai step6 satu per satu.
+Perubahan dari versi sebelumnya (MobileNetV2 128x128):
+  - Backbone: MobileNetV2 → ResNet50V2 (lebih dalam, lebih kuat)
+  - Input size: 128×128 → 224×224 (ukuran asli ImageNet)
+  - Tambah BiGRU setelah backbone (tangkap pola temporal emosi)
+  - SE Block dipertahankan (channel attention)
+  - SpecAugment dipertahankan
 """
 
 import os
@@ -40,7 +42,7 @@ SAMPLE_RATE = 22050   # Hz, standard librosa
 # SPEKTROGRAM
 # ---------------------------------------------------------------------------
 
-IMG_SIZE        = (128, 128)
+IMG_SIZE        = (224, 224)   # Opsi C: ukuran ImageNet untuk ResNet50V2
 N_MELS          = 128
 N_FFT           = 2048
 HOP_LENGTH      = 512

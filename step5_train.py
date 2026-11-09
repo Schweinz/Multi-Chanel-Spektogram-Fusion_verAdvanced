@@ -1,26 +1,43 @@
 """
-step5_train.py
-==============
-STEP KELIMA — training MobileNetV2 + SE Block + SpecAugment.
+step5_train.py  —  Opsi C: ResNet50V2 + SE Block + BiGRU + SpecAugment
+=======================================================================
+Arsitektur baru (Opsi C):
+  Input  : 224x224x4  (4-channel fused spectrogram, ukuran ImageNet)
+  Proj   : Conv2D(3, 1x1)        -> ubah 4ch -> 3ch agar ResNet50V2 bisa dipakai
+  Backbone: ResNet50V2 pretrained ImageNet, feature map 7x7x2048
+  SE     : Squeeze-and-Excitation block (channel attention, ratio=16)
+  BiGRU  : reshape feature map ke sekuens (49, 2048), lalu Bidirectional GRU(64)
+           -> tangkap pola temporal emosi di dimensi waktu spektrogram
+  Head   : Dense(128) + BN + Dropout -> Dense(8, softmax)
 
-Fix overfitting v2:
-- Phase 2 hanya unfreeze 50 layer terakhir (bukan semua)
-- L2 regularization di Dense layer
-- Dropout dinaikkan 0.3 -> 0.5
-- Label smoothing 0.1
-- Tambah ImageDataGenerator: flip horizontal + zoom kecil
-- Batch size dikecilkan: 16 (lebih stabil)
-- Phase 1 LR diturunkan: 1e-3 -> 5e-4
+Training 2 fase:
+  Phase 1 (frozen backbone): 30 epoch, LR=5e-4
+  Phase 2 (partial unfreeze last 100 layer): 100 epoch, LR=5e-5
+
+Regularisasi anti-overfitting:
+  - Partial unfreeze (bukan full fine-tune)
+  - Dropout 0.5
+  - L2 regularization 1e-4
+  - Label smoothing 0.1
+  - SpecAugment (freq + time masking)
+  - Flip horizontal + slight zoom
+
+Ablasi:
+  B1: Mel only, tanpa DIP, tanpa augmentasi
+  B2: Mel only, dengan DIP, dengan augmentasi
+  B3: 4ch, tanpa DIP, tanpa augmentasi
+  B4: 4ch, dengan DIP, dengan augmentasi (kondisi utama)
 """
 
 import os
 import sys
-import numpy as np
 import json
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+import time
+import numpy as np
 
+# ---------------------------------------------------------------------------
+# Self-patching config (agar %run di Colab selalu pakai path yang benar)
+# ---------------------------------------------------------------------------
 BASE_DIR = '/content/drive/MyDrive/SER_Advanced'
 sys.path.insert(0, BASE_DIR)
 import config as _cfg
@@ -32,404 +49,544 @@ _cfg.ENHANCED_DIR = os.path.join(BASE_DIR, 'enhanced_spectrograms')
 _cfg.FUSED_DIR    = os.path.join(BASE_DIR, 'fused_dataset')
 _cfg.MODEL_DIR    = os.path.join(BASE_DIR, 'models')
 _cfg.RESULT_DIR   = os.path.join(BASE_DIR, 'results')
+_cfg.IMG_SIZE     = (224, 224)   # Opsi C
 _cfg.create_dirs()
 
-FUSED_DIR    = _cfg.FUSED_DIR
-SPEC_DIR     = _cfg.SPEC_DIR
-MODEL_DIR    = _cfg.MODEL_DIR
-RESULT_DIR   = _cfg.RESULT_DIR
-N_CLASSES    = _cfg.N_CLASSES
-CHANNEL_ORDER = _cfg.CHANNEL_ORDER
-SE_RATIO     = _cfg.SE_RATIO
-SPEC_AUG_FREQ_MASK_MAX  = _cfg.SPEC_AUG_FREQ_MASK_MAX
-SPEC_AUG_TIME_MASK_MAX  = _cfg.SPEC_AUG_TIME_MASK_MAX
-SPEC_AUG_NUM_FREQ_MASKS = _cfg.SPEC_AUG_NUM_FREQ_MASKS
-SPEC_AUG_NUM_TIME_MASKS = _cfg.SPEC_AUG_NUM_TIME_MASKS
+FUSED_DIR      = _cfg.FUSED_DIR
+MODEL_DIR      = _cfg.MODEL_DIR
+RESULT_DIR     = _cfg.RESULT_DIR
+N_CLASSES      = _cfg.N_CLASSES
+EMOTION_LABELS = _cfg.EMOTION_LABELS
+IMG_SIZE       = _cfg.IMG_SIZE   # (224, 224)
 
-# ── Hyperparameter (override dari config untuk fix overfitting) ───────────────
-BATCH_SIZE      = 16       # turun dari 32, lebih stabil
-LR_PHASE1       = 5e-4     # turun dari 1e-3
-LR_PHASE2       = 5e-5     # turun dari 1e-4
-DROPOUT_RATE    = 0.5      # naik dari 0.3
-L2_REG          = 1e-4     # L2 regularization baru
-LABEL_SMOOTHING = 0.1      # label smoothing baru
+SE_RATIO               = _cfg.SE_RATIO              # 16
+SPEC_AUG_FREQ_MASK_MAX = _cfg.SPEC_AUG_FREQ_MASK_MAX   # 20
+SPEC_AUG_TIME_MASK_MAX = _cfg.SPEC_AUG_TIME_MASK_MAX   # 25
+SPEC_AUG_NUM_FREQ_MASKS = _cfg.SPEC_AUG_NUM_FREQ_MASKS  # 2
+SPEC_AUG_NUM_TIME_MASKS = _cfg.SPEC_AUG_NUM_TIME_MASKS  # 2
+
+# ---------------------------------------------------------------------------
+# Hyperparameter training (override config untuk Opsi C)
+# ---------------------------------------------------------------------------
+BATCH_SIZE      = 16        # lebih kecil krn 224x224 lebih berat di memori GPU
+LR_PHASE1       = 5e-4      # Phase 1: hanya head + proj + SE + BiGRU
+LR_PHASE2       = 5e-5      # Phase 2: partial unfreeze, LR lebih kecil
+DROPOUT_RATE    = 0.5       # dropout agresif untuk RAVDESS yg kecil (~1000 train)
+L2_REG          = 1e-4      # L2 regularization
+LABEL_SMOOTHING = 0.1       # mencegah model terlalu yakin pada label
 EPOCHS_PHASE1   = 30
 EPOCHS_PHASE2   = 100
-PATIENCE        = 20       # naik dari 15
+PATIENCE        = 20        # early stopping patience
+
+# Jumlah layer ResNet50V2 yang di-unfreeze di Phase 2
+# ResNet50V2 punya ~190 layer; unfreeze 100 layer terakhir
+UNFREEZE_LAST_N = 100
 
 import tensorflow as tf
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.layers import (
-    Input, Conv2D, GlobalAveragePooling2D,
-    Dropout, Dense, BatchNormalization,
-    Reshape, Multiply
-)
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import (
-    EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, CSVLogger
-)
-from tensorflow.keras.utils import to_categorical
-from tensorflow.keras import regularizers
-
-print(f"TensorFlow versi: {tf.__version__}")
-print(f"GPU tersedia: {tf.config.list_physical_devices('GPU')}")
-print(f"Hyperparameter: batch={BATCH_SIZE}, lr1={LR_PHASE1}, lr2={LR_PHASE2}, dropout={DROPOUT_RATE}")
+print(f"TensorFlow: {tf.__version__}")
+print(f"GPU: {tf.config.list_physical_devices('GPU')}")
 
 
-# ── SPECAUGMENT ───────────────────────────────────────────────────────────────
+# ===========================================================================
+# SpecAugment  (augmentasi pada domain spektrogram)
+# ===========================================================================
 
-def apply_specaugment(X):
-    """SpecAugment — Park et al., Interspeech 2019."""
-    X_aug = X.copy()
-    N, H, W, C = X_aug.shape
-    for i in range(N):
-        for _ in range(SPEC_AUG_NUM_FREQ_MASKS):
-            f  = np.random.randint(0, SPEC_AUG_FREQ_MASK_MAX + 1)
-            f0 = np.random.randint(0, max(1, H - f))
-            X_aug[i, f0:f0+f, :, :] = 0.0
-        for _ in range(SPEC_AUG_NUM_TIME_MASKS):
-            t  = np.random.randint(0, SPEC_AUG_TIME_MASK_MAX + 1)
-            t0 = np.random.randint(0, max(1, W - t))
-            X_aug[i, :, t0:t0+t, :] = 0.0
-    return X_aug
-
-
-def augment_batch(X):
+def spec_augment(x, training=False):
     """
-    Augmentasi ringan tambahan: flip horizontal + zoom kecil.
-    Hanya untuk training, tidak untuk val/test.
+    SpecAugment: masking acak frekuensi + waktu.
+    Park et al., Interspeech 2019.
+
+    x: tensor (H, W, C) float32
+    Hanya dijalankan saat training=True.
     """
-    X_aug = X.copy()
-    N = len(X_aug)
-    for i in range(N):
-        # Flip horizontal dengan prob 50%
-        if np.random.rand() > 0.5:
-            X_aug[i] = X_aug[i, :, ::-1, :]
-        # Zoom kecil dengan prob 30%
-        if np.random.rand() > 0.7:
-            h, w = X_aug[i].shape[:2]
-            zoom = np.random.uniform(0.85, 1.0)
-            new_h, new_w = int(h * zoom), int(w * zoom)
-            pad_h = (h - new_h) // 2
-            pad_w = (w - new_w) // 2
-            cropped = X_aug[i, pad_h:pad_h+new_h, pad_w:pad_w+new_w, :]
-            import cv2
-            resized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-            if resized.ndim == 2:
-                resized = resized[:, :, np.newaxis]
-            X_aug[i] = resized
-    return X_aug
+    if not training:
+        return x
+
+    H = tf.shape(x)[0]
+    W = tf.shape(x)[1]
+    C = tf.shape(x)[2]
+
+    # Frequency masking (masker pada dimensi frekuensi = sumbu vertikal H)
+    for _ in range(SPEC_AUG_NUM_FREQ_MASKS):
+        f = tf.random.uniform((), 0, SPEC_AUG_FREQ_MASK_MAX, dtype=tf.int32)
+        f0 = tf.random.uniform((), 0, tf.maximum(H - f, 1), dtype=tf.int32)
+        # Buat mask: set baris f0..f0+f ke 0
+        mask_top    = tf.ones([f0, W, C], dtype=x.dtype)
+        mask_middle = tf.zeros([f, W, C], dtype=x.dtype)
+        mask_bottom = tf.ones([tf.maximum(H - f0 - f, 0), W, C], dtype=x.dtype)
+        mask = tf.concat([mask_top, mask_middle, mask_bottom], axis=0)
+        mask = mask[:H]
+        x = x * mask
+
+    # Time masking (masker pada dimensi waktu = sumbu horizontal W)
+    for _ in range(SPEC_AUG_NUM_TIME_MASKS):
+        t = tf.random.uniform((), 0, SPEC_AUG_TIME_MASK_MAX, dtype=tf.int32)
+        t0 = tf.random.uniform((), 0, tf.maximum(W - t, 1), dtype=tf.int32)
+        mask_left   = tf.ones([H, t0, C], dtype=x.dtype)
+        mask_middle = tf.zeros([H, t, C], dtype=x.dtype)
+        mask_right  = tf.ones([H, tf.maximum(W - t0 - t, 0), C], dtype=x.dtype)
+        mask = tf.concat([mask_left, mask_middle, mask_right], axis=1)
+        mask = mask[:, :W, :]
+        x = x * mask
+
+    return x
 
 
-def visualize_specaugment(X_sample, idx=0):
-    original  = X_sample[idx:idx+1]
-    augmented = apply_specaugment(original.copy())
-    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
-    fig.suptitle("SpecAugment — Sebelum vs Sesudah", fontsize=13)
-    for col, ch in enumerate(CHANNEL_ORDER):
-        axes[0, col].imshow(original[0, :, :, col],  cmap='viridis', aspect='auto', origin='lower')
-        axes[0, col].set_title(f'{ch.upper()}\nAsli')
-        axes[0, col].axis('off')
-        axes[1, col].imshow(augmented[0, :, :, col], cmap='viridis', aspect='auto', origin='lower')
-        axes[1, col].set_title(f'{ch.upper()}\nSetelah SpecAugment')
-        axes[1, col].axis('off')
-    plt.tight_layout()
-    save_path = os.path.join(RESULT_DIR, "specaugment_demo.png")
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    plt.savefig(save_path, dpi=100, bbox_inches='tight')
-    plt.close()
-    print(f"SpecAugment demo: {save_path}")
-
-
-# ── SE BLOCK ──────────────────────────────────────────────────────────────────
+# ===========================================================================
+# SE Block  (Squeeze-and-Excitation)
+# ===========================================================================
 
 def se_block(x, ratio=SE_RATIO):
-    """Squeeze-and-Excitation Block — Hu et al., CVPR 2018."""
-    channels   = x.shape[-1]
-    squeeze    = GlobalAveragePooling2D()(x)
-    excitation = Dense(max(1, channels // ratio), activation='relu')(squeeze)
-    excitation = Dense(channels, activation='sigmoid')(excitation)
-    excitation = Reshape((1, 1, channels))(excitation)
-    return Multiply()([x, excitation])
-
-
-# ── ARSITEKTUR MODEL ──────────────────────────────────────────────────────────
-
-def build_model_4ch(n_classes=N_CLASSES):
-    """Model 4-channel: MobileNetV2 + SE Block + L2 regularization."""
-    inp  = Input(shape=(128, 128, 4), name='input_4ch')
-    x    = Conv2D(3, (1, 1), padding='same', name='channel_projection')(inp)
-    base = MobileNetV2(input_shape=(128,128,3), include_top=False,
-                       weights='imagenet', alpha=1.0)
-    base.trainable = False
-    x   = base(x, training=False)
-    x   = se_block(x, ratio=SE_RATIO)
-    x   = GlobalAveragePooling2D(name='gap')(x)
-    x   = Dropout(DROPOUT_RATE)(x)
-    x   = Dense(128, activation='relu', name='fc1',
-                kernel_regularizer=regularizers.l2(L2_REG))(x)
-    x   = BatchNormalization()(x)
-    x   = Dropout(DROPOUT_RATE)(x)
-    out = Dense(n_classes, activation='softmax', name='output')(x)
-    return Model(inp, out, name='SER_MobileNetV2_SE_4ch'), base
-
-
-def build_model_3ch(n_classes=N_CLASSES):
-    """Model 3-channel: MobileNetV2 + SE Block + L2 regularization."""
-    base = MobileNetV2(input_shape=(128,128,3), include_top=False,
-                       weights='imagenet', alpha=1.0)
-    base.trainable = False
-    inp = Input(shape=(128, 128, 3), name='input_3ch')
-    x   = base(inp, training=False)
-    x   = se_block(x, ratio=SE_RATIO)
-    x   = GlobalAveragePooling2D(name='gap')(x)
-    x   = Dropout(DROPOUT_RATE)(x)
-    x   = Dense(128, activation='relu', name='fc1',
-                kernel_regularizer=regularizers.l2(L2_REG))(x)
-    x   = BatchNormalization()(x)
-    x   = Dropout(DROPOUT_RATE)(x)
-    out = Dense(n_classes, activation='softmax', name='output')(x)
-    return Model(inp, out, name='SER_MobileNetV2_SE_3ch'), base
-
-
-# ── LOAD DATASET ──────────────────────────────────────────────────────────────
-
-def load_dataset_npz():
-    data_path = os.path.join(FUSED_DIR, "dataset.npz")
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(f"dataset.npz tidak ditemukan. Jalankan step4 dulu.")
-    data = np.load(data_path)
-    X_train, y_train = data['X_train'], data['y_train']
-    X_val,   y_val   = data['X_val'],   data['y_val']
-    X_test,  y_test  = data['X_test'],  data['y_test']
-    print(f"Dataset: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-    print(f"X range: [{X_train.min():.3f}, {X_train.max():.3f}]")
-    return X_train, y_train, X_val, y_val, X_test, y_test
-
-
-def load_b1_b3_data():
-    """Data tanpa DIP untuk B1/B3."""
-    from step4_build_dataset import build_full_dataset, split_dataset
-    print("Membangun dataset B1/B3 (tanpa DIP)...")
-    X_raw, y_raw = build_full_dataset(enhanced_dir=SPEC_DIR)
-    return split_dataset(X_raw, y_raw)
-
-
-def prepare_ablation_data(X, condition):
-    """B1/B2: triplikasi Mel -> 3ch. B3/B4: 4ch langsung."""
-    if condition in ('B1', 'B2'):
-        mel = X[:, :, :, 0:1]
-        return np.concatenate([mel, mel, mel], axis=-1)
-    return X
-
-
-# ── TRAINING 2 FASE ───────────────────────────────────────────────────────────
-
-def train_model(model, base_model, X_tr, y_tr, X_vl, y_vl,
-                model_name, model_dir, use_specaugment=False):
     """
-    Training 2 fase dengan anti-overfitting:
+    SE Block: channel attention.
+    Hu et al., CVPR 2018.
 
-    Phase 1 — FROZEN backbone (lr=5e-4, 30 ep)
-      Hanya head yang belajar. LR kecil supaya tidak lari terlalu jauh.
-
-    Phase 2 — PARTIAL UNFREEZE: hanya 50 layer terakhir backbone (lr=5e-5)
-      Tidak unfreeze semua — terlalu banyak parameter bebas untuk 1008 sampel.
-      50 layer terakhir MobileNetV2 = blok konvolusi terakhir yang paling
-      task-specific, sisanya tetap frozen (fitur umum imagenet).
+    x: tensor (batch, H, W, C) dari output backbone
+    Return: tensor (batch, H, W, C) setelah channel recalibration
     """
-    os.makedirs(model_dir, exist_ok=True)
-    ckpt_path = os.path.join(model_dir, f"{model_name}_best.keras")
+    C = x.shape[-1]
+    # Squeeze: global average pooling -> (batch, C)
+    squeeze = tf.keras.layers.GlobalAveragePooling2D()(x)
+    # Excitation: 2 Dense layers dengan bottleneck C/ratio
+    excitation = tf.keras.layers.Dense(
+        max(C // ratio, 1), activation='relu',
+        kernel_regularizer=tf.keras.regularizers.l2(L2_REG)
+    )(squeeze)
+    excitation = tf.keras.layers.Dense(
+        C, activation='sigmoid',
+        kernel_regularizer=tf.keras.regularizers.l2(L2_REG)
+    )(excitation)
+    # Reshape ke (batch, 1, 1, C) untuk broadcasting
+    excitation = tf.keras.layers.Reshape((1, 1, C))(excitation)
+    # Scale: element-wise multiply
+    return tf.keras.layers.Multiply()([x, excitation])
 
-    # Augmentasi training
-    if use_specaugment:
-        X_input1 = augment_batch(apply_specaugment(X_tr))
+
+# ===========================================================================
+# Membangun model Opsi C
+# ===========================================================================
+
+def build_model_opsi_c(input_shape=(224, 224, 4), n_classes=8):
+    """
+    Arsitektur lengkap Opsi C:
+      Input (224,224,4)
+      -> Conv2D projection (224,224,3)
+      -> ResNet50V2 pretrained ImageNet (output 7,7,2048)
+      -> SE Block channel attention
+      -> Reshape ke (49, 2048)
+      -> BiGRU(64) temporal modeling
+      -> Dense head dengan Dropout + BN
+      -> Softmax output
+    """
+    inputs = tf.keras.Input(shape=input_shape, name='input_4ch')
+
+    # --- Channel Projection: 4ch -> 3ch ---
+    # ResNet50V2 pretrained mengharapkan 3-channel input (RGB).
+    # Proyeksi 1x1 Conv2D belajar kombinasi optimal dari 4 channel spektrogram.
+    x = tf.keras.layers.Conv2D(
+        3, (1, 1), padding='same', use_bias=False,
+        name='channel_proj',
+        kernel_regularizer=tf.keras.regularizers.l2(L2_REG)
+    )(inputs)
+    x = tf.keras.layers.BatchNormalization(name='proj_bn')(x)
+    x = tf.keras.layers.Activation('relu', name='proj_relu')(x)
+
+    # --- Backbone: ResNet50V2 pretrained ImageNet ---
+    # include_top=False -> kita pakai feature map 7x7x2048
+    base_model = tf.keras.applications.ResNet50V2(
+        include_top=False,
+        weights='imagenet',
+        input_shape=(224, 224, 3),
+        pooling=None   # kita handle sendiri
+    )
+    base_model.trainable = False   # frozen di Phase 1
+    x = base_model(x, training=False)
+    # x sekarang: (batch, 7, 7, 2048)
+
+    # --- SE Block: channel attention ---
+    x = se_block(x, ratio=SE_RATIO)
+    # x masih: (batch, 7, 7, 2048)
+
+    # --- BiGRU: temporal modeling ---
+    # Reshape feature map (7, 7, 2048) -> sekuens (49, 2048)
+    # 49 = 7x7 lokasi spatial, tiap lokasi = vektor 2048 dimensi
+    # BiGRU akan menangkap pola temporal antar lokasi spektrogram
+    x = tf.keras.layers.Reshape((7 * 7, 2048), name='reshape_to_seq')(x)
+
+    # Bidirectional GRU: forward + backward -> output size 2x64=128
+    x = tf.keras.layers.Bidirectional(
+        tf.keras.layers.GRU(
+            64,
+            return_sequences=False,
+            kernel_regularizer=tf.keras.regularizers.l2(L2_REG),
+            recurrent_regularizer=tf.keras.regularizers.l2(L2_REG / 10),
+        ),
+        name='bigru'
+    )(x)
+    # x: (batch, 128)
+
+    # --- Head ---
+    x = tf.keras.layers.Dense(
+        128,
+        kernel_regularizer=tf.keras.regularizers.l2(L2_REG),
+        name='head_dense'
+    )(x)
+    x = tf.keras.layers.BatchNormalization(name='head_bn')(x)
+    x = tf.keras.layers.Activation('relu', name='head_relu')(x)
+    x = tf.keras.layers.Dropout(DROPOUT_RATE, name='head_dropout')(x)
+
+    outputs = tf.keras.layers.Dense(
+        n_classes,
+        activation='softmax',
+        name='predictions'
+    )(x)
+
+    model = tf.keras.Model(inputs=inputs, outputs=outputs, name='SER_OpsiC')
+    return model, base_model
+
+
+# ===========================================================================
+# Data augmentation (di luar SpecAugment)
+# ===========================================================================
+
+def augment_sample(x, y):
+    """Flip horizontal + slight zoom + SpecAugment. Dipakai di tf.data pipeline."""
+    # Horizontal flip (membalik dimensi waktu spektrogram)
+    x = tf.image.random_flip_left_right(x)
+    # Random zoom: crop acak 85-100% lalu resize kembali
+    H, W, C = IMG_SIZE[0], IMG_SIZE[1], 4
+    scale = tf.random.uniform((), 0.85, 1.0)
+    new_H = tf.cast(tf.cast(H, tf.float32) * scale, tf.int32)
+    new_W = tf.cast(tf.cast(W, tf.float32) * scale, tf.int32)
+    x = tf.image.random_crop(x, [new_H, new_W, C])
+    x = tf.image.resize(x, [H, W])
+    # SpecAugment
+    x = spec_augment(x, training=True)
+    return x, y
+
+
+def augment_sample_mel(x, y):
+    """Augmentasi untuk kondisi Mel-only: pakai channel 0 saja di semua posisi."""
+    mel = x[:, :, 0:1]
+    x_mel = tf.repeat(mel, 4, axis=-1)
+    x_mel = tf.image.random_flip_left_right(x_mel)
+    H, W, C = IMG_SIZE[0], IMG_SIZE[1], 4
+    scale = tf.random.uniform((), 0.85, 1.0)
+    new_H = tf.cast(tf.cast(H, tf.float32) * scale, tf.int32)
+    new_W = tf.cast(tf.cast(W, tf.float32) * scale, tf.int32)
+    x_mel = tf.image.random_crop(x_mel, [new_H, new_W, C])
+    x_mel = tf.image.resize(x_mel, [H, W])
+    x_mel = spec_augment(x_mel, training=True)
+    return x_mel, y
+
+
+# ===========================================================================
+# Training satu kondisi ablasi
+# ===========================================================================
+
+def train_one_condition(X_train, y_train, X_val, y_val, X_test, y_test,
+                         condition_name, use_4ch=True, use_aug=True):
+    """
+    Latih model untuk satu kondisi ablasi (B1-B4).
+
+    condition_name: 'B1', 'B2', 'B3', atau 'B4'
+    use_4ch : True  -> gunakan semua 4 channel
+              False -> hanya Mel (channel 0, direplikasi 4x)
+    use_aug : True  -> pakai SpecAugment + flip + zoom
+              False -> tanpa augmentasi
+    """
+    print(f"\n{'='*60}")
+    print(f"Kondisi: {condition_name}")
+    print(f"  4-channel: {use_4ch}  |  Augmentasi: {use_aug}")
+    print(f"  Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
+    print(f"{'='*60}")
+
+    tf.keras.backend.clear_session()
+
+    # --- Siapkan data ---
+    if not use_4ch:
+        # Hanya Mel: ambil channel 0, replikasi ke 4 channel
+        mel_train = np.repeat(X_train[:, :, :, 0:1], 4, axis=-1)
+        mel_val   = np.repeat(X_val[:, :, :, 0:1],   4, axis=-1)
+        mel_test  = np.repeat(X_test[:, :, :, 0:1],  4, axis=-1)
     else:
-        X_input1 = X_tr
+        mel_train = X_train
+        mel_val   = X_val
+        mel_test  = X_test
 
-    y_tr_oh = to_categorical(y_tr, N_CLASSES)
-    y_vl_oh = to_categorical(y_vl, N_CLASSES)
+    # One-hot encoding
+    y_train_oh = tf.keras.utils.to_categorical(y_train, N_CLASSES)
+    y_val_oh   = tf.keras.utils.to_categorical(y_val,   N_CLASSES)
 
-    # Phase 1: frozen
-    print(f"\n[{model_name}] Phase 1: head training (frozen, lr={LR_PHASE1}, {EPOCHS_PHASE1} ep)...")
+    # --- tf.data pipeline ---
+    train_ds = tf.data.Dataset.from_tensor_slices((mel_train, y_train_oh))
+    if use_aug:
+        if not use_4ch:
+            train_ds = train_ds.map(augment_sample_mel,
+                                    num_parallel_calls=tf.data.AUTOTUNE)
+        else:
+            train_ds = train_ds.map(augment_sample,
+                                    num_parallel_calls=tf.data.AUTOTUNE)
+    train_ds = (train_ds
+                .shuffle(1024, reshuffle_each_iteration=True)
+                .batch(BATCH_SIZE)
+                .prefetch(tf.data.AUTOTUNE))
+
+    val_ds = (tf.data.Dataset
+              .from_tensor_slices((mel_val, y_val_oh))
+              .batch(BATCH_SIZE)
+              .prefetch(tf.data.AUTOTUNE))
+
+    # --- Bangun model ---
+    model, base_model = build_model_opsi_c(
+        input_shape=(IMG_SIZE[0], IMG_SIZE[1], 4),
+        n_classes=N_CLASSES
+    )
+
+    # ===========================================================
+    # Phase 1: Latih head (backbone frozen)
+    # ===========================================================
+    print(f"\n--- Phase 1: Backbone frozen, latih head ---")
     model.compile(
-        optimizer=Adam(LR_PHASE1),
-        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+        optimizer=tf.keras.optimizers.Adam(LR_PHASE1),
+        loss=tf.keras.losses.CategoricalCrossentropy(
+            label_smoothing=LABEL_SMOOTHING
+        ),
         metrics=['accuracy']
     )
+
+    ckpt_path = os.path.join(MODEL_DIR, f"best_{condition_name}_opsiC.h5")
+    callbacks_p1 = [
+        tf.keras.callbacks.ModelCheckpoint(
+            ckpt_path, monitor='val_accuracy',
+            save_best_only=True, verbose=0
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy', patience=PATIENCE,
+            restore_best_weights=True, verbose=1
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_accuracy', factor=0.5, patience=10,
+            min_lr=1e-6, verbose=1
+        )
+    ]
+
+    t0 = time.time()
     hist1 = model.fit(
-        X_input1, y_tr_oh,
-        validation_data=(X_vl, y_vl_oh),
-        batch_size=BATCH_SIZE, epochs=EPOCHS_PHASE1,
-        callbacks=[
-            ModelCheckpoint(ckpt_path, monitor='val_accuracy', save_best_only=True, verbose=0),
-            CSVLogger(os.path.join(model_dir, f"{model_name}_phase1.csv")),
-        ], verbose=1
+        train_ds, epochs=EPOCHS_PHASE1,
+        validation_data=val_ds,
+        callbacks=callbacks_p1,
+        verbose=1
     )
 
-    # Phase 2: partial unfreeze (50 layer terakhir saja)
-    print(f"\n[{model_name}] Phase 2: partial fine-tune (last 50 layers, lr={LR_PHASE2})...")
-    # Freeze semua dulu
-    base_model.trainable = False
-    # Unfreeze hanya 50 layer terakhir
-    for layer in base_model.layers[-50:]:
+    # ===========================================================
+    # Phase 2: Partial unfreeze + fine-tune
+    # ===========================================================
+    print(f"\n--- Phase 2: Partial unfreeze ({UNFREEZE_LAST_N} layer terakhir) ---")
+
+    # Freeze semua dulu, kemudian unfreeze N layer terakhir
+    base_model.trainable = True
+    for layer in base_model.layers:
+        layer.trainable = False
+    for layer in base_model.layers[-UNFREEZE_LAST_N:]:
+        # Jangan unfreeze BatchNormalization (menjaga statistik pretrained)
         if not isinstance(layer, tf.keras.layers.BatchNormalization):
             layer.trainable = True
 
-    if use_specaugment:
-        X_input2 = augment_batch(apply_specaugment(X_tr))
-    else:
-        X_input2 = X_tr
+    unfrozen = sum(1 for l in base_model.layers if l.trainable)
+    print(f"  Layer trainable: {unfrozen}/{len(base_model.layers)}")
 
     model.compile(
-        optimizer=Adam(LR_PHASE2),
-        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTHING),
+        optimizer=tf.keras.optimizers.Adam(LR_PHASE2),
+        loss=tf.keras.losses.CategoricalCrossentropy(
+            label_smoothing=LABEL_SMOOTHING
+        ),
         metrics=['accuracy']
     )
+
+    callbacks_p2 = [
+        tf.keras.callbacks.ModelCheckpoint(
+            ckpt_path, monitor='val_accuracy',
+            save_best_only=True, verbose=0
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy', patience=PATIENCE,
+            restore_best_weights=True, verbose=1
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_accuracy', factor=0.5, patience=10,
+            min_lr=1e-7, verbose=1
+        )
+    ]
+
     hist2 = model.fit(
-        X_input2, y_tr_oh,
-        validation_data=(X_vl, y_vl_oh),
-        batch_size=BATCH_SIZE, epochs=EPOCHS_PHASE2,
-        callbacks=[
-            EarlyStopping(monitor='val_accuracy', patience=PATIENCE,
-                          restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                              patience=8, min_lr=1e-8, verbose=1),
-            ModelCheckpoint(ckpt_path, monitor='val_accuracy', save_best_only=True, verbose=0),
-            CSVLogger(os.path.join(model_dir, f"{model_name}_phase2.csv")),
-        ], verbose=1
+        train_ds, epochs=EPOCHS_PHASE2,
+        validation_data=val_ds,
+        callbacks=callbacks_p2,
+        verbose=1
     )
-    return hist1, hist2
+    training_time = time.time() - t0
+
+    # --- Evaluasi test set ---
+    # Muat checkpoint terbaik (val_accuracy terbaik)
+    if os.path.exists(ckpt_path):
+        model.load_weights(ckpt_path)
+
+    test_ds = (tf.data.Dataset
+               .from_tensor_slices((mel_test, y_test))
+               .batch(BATCH_SIZE))
+    y_pred_probs = model.predict(test_ds, verbose=0)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+
+    # Hitung metrik
+    from sklearn.metrics import (
+        accuracy_score, f1_score, classification_report, confusion_matrix
+    )
+    test_acc = accuracy_score(y_test, y_pred)
+    test_f1  = f1_score(y_test, y_pred, average='weighted')
+    report   = classification_report(
+        y_test, y_pred,
+        target_names=EMOTION_LABELS,
+        output_dict=True
+    )
+    cm = confusion_matrix(y_test, y_pred).tolist()
+
+    best_val_acc = max(
+        max(hist1.history.get('val_accuracy', [0])),
+        max(hist2.history.get('val_accuracy', [0]))
+    )
+
+    print(f"\n  Test Accuracy: {test_acc:.4f} ({test_acc*100:.2f}%)")
+    print(f"  Test F1-Score: {test_f1:.4f} ({test_f1*100:.2f}%)")
+    print(f"  Best Val Acc : {best_val_acc:.4f} ({best_val_acc*100:.2f}%)")
+    print(f"  Waktu latih  : {training_time:.0f}s")
+
+    return {
+        'condition':          condition_name,
+        'architecture':       'ResNet50V2+SE+BiGRU',
+        'use_4ch':            use_4ch,
+        'use_aug':            use_aug,
+        'test_accuracy':      round(float(test_acc), 4),
+        'test_f1_weighted':   round(float(test_f1), 4),
+        'best_val_accuracy':  round(float(best_val_acc), 4),
+        'training_time_s':    round(training_time, 1),
+        'per_class':          report,
+        'confusion_matrix':   cm,
+        'phase1_history': {
+            'accuracy':     [round(v, 4) for v in hist1.history.get('accuracy', [])],
+            'val_accuracy': [round(v, 4) for v in hist1.history.get('val_accuracy', [])],
+        },
+        'phase2_history': {
+            'accuracy':     [round(v, 4) for v in hist2.history.get('accuracy', [])],
+            'val_accuracy': [round(v, 4) for v in hist2.history.get('val_accuracy', [])],
+        },
+    }
 
 
-def plot_training_history(hist1, hist2, model_name):
-    acc      = hist1.history['accuracy']     + hist2.history['accuracy']
-    val_acc  = hist1.history['val_accuracy'] + hist2.history['val_accuracy']
-    loss     = hist1.history['loss']         + hist2.history['loss']
-    val_loss = hist1.history['val_loss']     + hist2.history['val_loss']
-    p1_end   = len(hist1.history['accuracy'])
-    epochs   = range(1, len(acc) + 1)
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle(f'Training History — {model_name}', fontsize=13)
-    for ax, (tr, vl, lbl) in zip([ax1, ax2], [
-        (acc, val_acc, 'Accuracy'), (loss, val_loss, 'Loss')
-    ]):
-        ax.plot(epochs, tr, label=f'Train {lbl}')
-        ax.plot(epochs, vl, label=f'Val {lbl}')
-        ax.axvline(x=p1_end, color='gray', linestyle='--',
-                   label=f'Phase 2 mulai (ep {p1_end+1})')
-        ax.set_xlabel('Epoch')
-        ax.legend()
-        ax.set_title(lbl)
-    plt.tight_layout()
-    out = os.path.join(RESULT_DIR, f"training_{model_name}.png")
-    plt.savefig(out, dpi=100, bbox_inches='tight')
-    plt.close()
-    print(f"Plot disimpan: {out}")
-
-
-# ── MAIN: ABLATION STUDY ──────────────────────────────────────────────────────
+# ===========================================================================
+# Main: jalankan semua ablasi
+# ===========================================================================
 
 if __name__ == "__main__":
-    print("STEP 5: MobileNetV2 + SE Block + SpecAugment (Anti-Overfitting v2)")
+    print("STEP 5: Training SER Opsi C")
+    print("    Backbone : ResNet50V2 (pretrained ImageNet)")
+    print("    Input    : 224x224x4")
+    print("    Attention: SE Block (channel, ratio=16)")
+    print("    Temporal : BiGRU(64) bidirectional")
+    print("    Augmen.  : SpecAugment + flip + zoom")
     print("=" * 60)
-    print(f"Dropout={DROPOUT_RATE}, L2={L2_REG}, LabelSmoothing={LABEL_SMOOTHING}")
-    print(f"Batch={BATCH_SIZE}, LR1={LR_PHASE1}, LR2={LR_PHASE2}, Patience={PATIENCE}")
-    print(f"Phase2: partial unfreeze (last 50 layers only)")
-    print()
-    print("B1: Single Mel, No DIP, No Aug  <- baseline")
-    print("B2: Single Mel, DIP, SpecAugment+flip")
-    print("B3: 4-Channel, No DIP, No Aug")
-    print("B4: 4-Channel, DIP, SpecAugment+flip  <- PROPOSED")
-    print()
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(RESULT_DIR, exist_ok=True)
+    # --- Muat dataset ---
+    dataset_path = os.path.join(FUSED_DIR, "dataset.npz")
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(
+            f"Dataset tidak ditemukan: {dataset_path}\n"
+            "Pastikan step2 -> step3 -> step4 sudah dijalankan dengan IMG_SIZE=224."
+        )
 
-    X_train, y_train, X_val, y_val, X_test, y_test = load_dataset_npz()
-    X_tr_raw, y_tr_raw, X_vl_raw, y_vl_raw, X_ts_raw, y_ts_raw = load_b1_b3_data()
+    data = np.load(dataset_path)
+    X_train = data['X_train'].astype(np.float32)
+    y_train = data['y_train'].astype(np.int32)
+    X_val   = data['X_val'].astype(np.float32)
+    y_val   = data['y_val'].astype(np.int32)
+    X_test  = data['X_test'].astype(np.float32)
+    y_test  = data['y_test'].astype(np.int32)
 
-    visualize_specaugment(X_train, idx=0)
+    # Validasi ukuran input sesuai Opsi C (224x224)
+    actual_size = X_train.shape[1:3]
+    expected = (IMG_SIZE[0], IMG_SIZE[1])
+    if actual_size != expected:
+        raise ValueError(
+            f"Dataset size {actual_size} != {expected}.\n"
+            "Hapus folder spectrograms/ dan fused_dataset/ lalu jalankan "
+            "step2 -> step3 -> step4 ulang dengan IMG_SIZE=(224,224)."
+        )
 
-    ablation = {}
+    print(f"\nDataset dimuat:")
+    print(f"  X_train: {X_train.shape}  y_train: {y_train.shape}")
+    print(f"  X_val  : {X_val.shape}")
+    print(f"  X_test : {X_test.shape}")
 
-    # B1
-    print("\n" + "="*60)
-    print("B1: Mel, No DIP, No Aug")
-    model_b1, base_b1 = build_model_3ch()
-    h1a, h1b = train_model(model_b1, base_b1,
-        prepare_ablation_data(X_tr_raw, 'B1'), y_tr_raw,
-        prepare_ablation_data(X_vl_raw, 'B1'), y_vl_raw,
-        'B1_mel_nodip_noaug', MODEL_DIR, use_specaugment=False)
-    plot_training_history(h1a, h1b, 'B1')
-    ablation['B1'] = {'model': model_b1,
-                      'X_test': prepare_ablation_data(X_ts_raw, 'B1'),
-                      'y_test': y_ts_raw,
-                      'description': 'Single Mel, No DIP, No SpecAugment'}
+    # --- Cek dataset tanpa DIP untuk ablasi B1/B3 ---
+    dataset_nodip_path = os.path.join(FUSED_DIR, "dataset_nodip.npz")
+    if os.path.exists(dataset_nodip_path):
+        data_nodip = np.load(dataset_nodip_path)
+        X_train_nd = data_nodip['X_train'].astype(np.float32)
+        y_train_nd = data_nodip['y_train'].astype(np.int32)
+        X_val_nd   = data_nodip['X_val'].astype(np.float32)
+        y_val_nd   = data_nodip['y_val'].astype(np.int32)
+        X_test_nd  = data_nodip['X_test'].astype(np.float32)
+        y_test_nd  = data_nodip['y_test'].astype(np.int32)
+        print(f"\nDataset tanpa DIP ditemukan: {dataset_nodip_path}")
+    else:
+        print(f"\n[INFO] dataset_nodip.npz tidak ada -> B1/B3 pakai dataset.npz (DIP ON)")
+        print("       Untuk ablasi ketat B1/B3, jalankan step4 dengan SPEC_DIR (bukan ENHANCED_DIR).")
+        X_train_nd, y_train_nd = X_train, y_train
+        X_val_nd,   y_val_nd   = X_val,   y_val
+        X_test_nd,  y_test_nd  = X_test,  y_test
 
-    # B2
-    print("\n" + "="*60)
-    print("B2: Mel, DIP, SpecAugment")
-    model_b2, base_b2 = build_model_3ch()
-    h2a, h2b = train_model(model_b2, base_b2,
-        prepare_ablation_data(X_train, 'B2'), y_train,
-        prepare_ablation_data(X_val, 'B2'), y_val,
-        'B2_mel_dip_aug', MODEL_DIR, use_specaugment=True)
-    plot_training_history(h2a, h2b, 'B2')
-    ablation['B2'] = {'model': model_b2,
-                      'X_test': prepare_ablation_data(X_test, 'B2'),
-                      'y_test': y_test,
-                      'description': 'Single Mel, DIP, SpecAugment'}
+    # --- Jalankan 4 kondisi ablasi ---
+    # B1: Mel only, tanpa DIP, tanpa augmentasi
+    # B2: Mel only, dengan DIP, dengan augmentasi
+    # B3: 4ch, tanpa DIP, tanpa augmentasi
+    # B4: 4ch, dengan DIP, dengan augmentasi (kondisi utama / proposed method)
+    conditions = [
+        # (name, X_tr, y_tr, X_v, y_v, X_te, y_te, use_4ch, use_aug)
+        ('B1', X_train_nd, y_train_nd, X_val_nd, y_val_nd, X_test_nd, y_test_nd, False, False),
+        ('B2', X_train,    y_train,    X_val,    y_val,    X_test,    y_test,    False, True),
+        ('B3', X_train_nd, y_train_nd, X_val_nd, y_val_nd, X_test_nd, y_test_nd, True,  False),
+        ('B4', X_train,    y_train,    X_val,    y_val,    X_test,    y_test,    True,  True),
+    ]
 
-    # B3
-    print("\n" + "="*60)
-    print("B3: 4-Channel, No DIP, No Aug")
-    model_b3, base_b3 = build_model_4ch()
-    h3a, h3b = train_model(model_b3, base_b3,
-        X_tr_raw, y_tr_raw, X_vl_raw, y_vl_raw,
-        'B3_4ch_nodip_noaug', MODEL_DIR, use_specaugment=False)
-    plot_training_history(h3a, h3b, 'B3')
-    ablation['B3'] = {'model': model_b3,
-                      'X_test': X_ts_raw,
-                      'y_test': y_ts_raw,
-                      'description': '4-Channel, No DIP, No SpecAugment'}
+    results = []
+    summary_path = os.path.join(RESULT_DIR, "ablation_summary.json")
 
-    # B4
-    print("\n" + "="*60)
-    print("B4: 4-Channel, DIP, SpecAugment — PROPOSED")
-    model_b4, base_b4 = build_model_4ch()
-    h4a, h4b = train_model(model_b4, base_b4,
-        X_train, y_train, X_val, y_val,
-        'B4_4ch_dip_aug', MODEL_DIR, use_specaugment=True)
-    plot_training_history(h4a, h4b, 'B4')
-    ablation['B4'] = {'model': model_b4,
-                      'X_test': X_test,
-                      'y_test': y_test,
-                      'description': '4-Channel, DIP, SpecAugment (Proposed)'}
+    for cond in conditions:
+        name, Xtr, ytr, Xv, yv, Xte, yte, use_4ch, use_aug = cond
+        result = train_one_condition(
+            Xtr, ytr, Xv, yv, Xte, yte,
+            condition_name=name,
+            use_4ch=use_4ch,
+            use_aug=use_aug
+        )
+        results.append(result)
 
-    # Ringkasan
-    print("\n" + "="*60)
-    print("RINGKASAN ABLATION STUDY")
-    print(f"{'Kondisi':<8} {'Test Accuracy':>14} {'F1 Weighted':>12}  Deskripsi")
-    print("-" * 60)
+        # Simpan progress (agar tidak hilang jika Colab crash)
+        with open(summary_path, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"  Progress disimpan -> {summary_path}")
 
-    from sklearn.metrics import f1_score as sk_f1
+    # --- Ringkasan akhir ---
+    print("\n" + "=" * 60)
+    print("RINGKASAN ABLASI -- Opsi C (ResNet50V2 + SE + BiGRU)")
+    print("=" * 60)
+    print(f"{'Kondisi':<10} {'Test Acc':>10} {'Test F1':>10} {'Val Acc':>10}")
+    print("-" * 44)
+    for r in results:
+        print(f"{r['condition']:<10} "
+              f"{r['test_accuracy']*100:>9.2f}% "
+              f"{r['test_f1_weighted']*100:>9.2f}% "
+              f"{r['best_val_accuracy']*100:>9.2f}%")
 
-    summary = []
-    for cond, r in ablation.items():
-        y_pred = np.argmax(r['model'].predict(r['X_test'], verbose=0), axis=1)
-        acc    = float(np.mean(y_pred == r['y_test']))
-        f1     = float(sk_f1(r['y_test'], y_pred, average='weighted'))
-        summary.append({
-            'name': cond, 'accuracy': round(acc, 4),
-            'f1_weighted': round(f1, 4), 'description': r['description']
-        })
-        print(f"{cond:<8} {acc*100:>13.2f}% {f1*100:>11.2f}%  {r['description']}")
-
-    with open(os.path.join(RESULT_DIR, "ablation_summary.json"), 'w') as f:
-        json.dump(summary, f, indent=2)
-
-    best = max(summary, key=lambda x: x['accuracy'])
-    print(f"\nTerbaik: {best['name']} — Accuracy {best['accuracy']*100:.2f}%, F1 {best['f1_weighted']*100:.2f}%")
-    print("\nStep 5 selesai. Lanjut ke step6_evaluate_gradcam.py")
+    print(f"\nHasil lengkap -> {summary_path}")
+    print("Step 5 selesai. Lanjut ke step6_evaluation.py untuk visualisasi.")
