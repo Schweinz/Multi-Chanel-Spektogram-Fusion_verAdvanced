@@ -24,13 +24,31 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-sys.path.append('/content/drive/MyDrive/SER_Advanced')
-from config import (
-    RAW_DATA_DIR, SPEC_DIR,
-    SAMPLE_RATE, IMG_SIZE,
-    N_MELS, N_FFT, HOP_LENGTH,
-    N_MFCC, N_BINS, BINS_PER_OCTAVE
-)
+BASE_DIR = '/content/drive/MyDrive/SER_Advanced'
+sys.path.insert(0, BASE_DIR)
+import config as _cfg
+
+# Auto-patch paths agar selalu mengarah ke Drive
+_cfg.BASE_DIR     = BASE_DIR
+_cfg.DATA_DIR     = os.path.join(BASE_DIR, 'ravdess_data')
+_cfg.RAW_DATA_DIR = os.path.join(BASE_DIR, 'ravdess_data')
+_cfg.SPEC_DIR     = os.path.join(BASE_DIR, 'spectrograms')
+_cfg.ENHANCED_DIR = os.path.join(BASE_DIR, 'enhanced_spectrograms')
+_cfg.FUSED_DIR    = os.path.join(BASE_DIR, 'fused_dataset')
+_cfg.MODEL_DIR    = os.path.join(BASE_DIR, 'models')
+_cfg.RESULT_DIR   = os.path.join(BASE_DIR, 'results')
+_cfg.create_dirs()
+
+RAW_DATA_DIR   = _cfg.RAW_DATA_DIR
+SPEC_DIR       = _cfg.SPEC_DIR
+SAMPLE_RATE    = _cfg.SAMPLE_RATE
+IMG_SIZE       = _cfg.IMG_SIZE
+N_MELS         = _cfg.N_MELS
+N_FFT          = _cfg.N_FFT
+HOP_LENGTH     = _cfg.HOP_LENGTH
+N_MFCC         = _cfg.N_MFCC
+N_BINS         = _cfg.N_BINS
+BINS_PER_OCTAVE = _cfg.BINS_PER_OCTAVE
 
 
 def load_audio(filepath, target_duration=3.0):

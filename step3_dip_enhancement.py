@@ -29,12 +29,25 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-sys.path.append('/content/drive/MyDrive/SER_Advanced')
-from config import (
-    SPEC_DIR, ENHANCED_DIR,
-    CLAHE_CLIP_LIMIT, CLAHE_TILE_GRID,
-    UM_SIGMA, UM_STRENGTH
-)
+BASE_DIR = '/content/drive/MyDrive/SER_Advanced'
+sys.path.insert(0, BASE_DIR)
+import config as _cfg
+_cfg.BASE_DIR     = BASE_DIR
+_cfg.DATA_DIR     = os.path.join(BASE_DIR, 'ravdess_data')
+_cfg.RAW_DATA_DIR = os.path.join(BASE_DIR, 'ravdess_data')
+_cfg.SPEC_DIR     = os.path.join(BASE_DIR, 'spectrograms')
+_cfg.ENHANCED_DIR = os.path.join(BASE_DIR, 'enhanced_spectrograms')
+_cfg.FUSED_DIR    = os.path.join(BASE_DIR, 'fused_dataset')
+_cfg.MODEL_DIR    = os.path.join(BASE_DIR, 'models')
+_cfg.RESULT_DIR   = os.path.join(BASE_DIR, 'results')
+_cfg.create_dirs()
+
+SPEC_DIR        = _cfg.SPEC_DIR
+ENHANCED_DIR    = _cfg.ENHANCED_DIR
+CLAHE_CLIP_LIMIT = _cfg.CLAHE_CLIP_LIMIT
+CLAHE_TILE_GRID = _cfg.CLAHE_TILE_GRID
+UM_SIGMA        = _cfg.UM_SIGMA
+UM_STRENGTH     = _cfg.UM_STRENGTH
 
 
 def apply_clahe(img):

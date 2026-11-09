@@ -20,13 +20,30 @@ from collections import defaultdict
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-sys.path.append('/content/drive/MyDrive/SER_Advanced')
-from config import (
-    ENHANCED_DIR, SPEC_DIR, FUSED_DIR,
-    EMOTION_MAP, EMOTION_LABELS, N_CLASSES,
-    IMG_SIZE, CHANNEL_ORDER,
-    RANDOM_SEED, TEST_SIZE, VAL_SIZE
-)
+BASE_DIR = '/content/drive/MyDrive/SER_Advanced'
+sys.path.insert(0, BASE_DIR)
+import config as _cfg
+_cfg.BASE_DIR     = BASE_DIR
+_cfg.DATA_DIR     = os.path.join(BASE_DIR, 'ravdess_data')
+_cfg.RAW_DATA_DIR = os.path.join(BASE_DIR, 'ravdess_data')
+_cfg.SPEC_DIR     = os.path.join(BASE_DIR, 'spectrograms')
+_cfg.ENHANCED_DIR = os.path.join(BASE_DIR, 'enhanced_spectrograms')
+_cfg.FUSED_DIR    = os.path.join(BASE_DIR, 'fused_dataset')
+_cfg.MODEL_DIR    = os.path.join(BASE_DIR, 'models')
+_cfg.RESULT_DIR   = os.path.join(BASE_DIR, 'results')
+_cfg.create_dirs()
+
+ENHANCED_DIR   = _cfg.ENHANCED_DIR
+SPEC_DIR       = _cfg.SPEC_DIR
+FUSED_DIR      = _cfg.FUSED_DIR
+EMOTION_MAP    = _cfg.EMOTION_MAP
+EMOTION_LABELS = _cfg.EMOTION_LABELS
+N_CLASSES      = _cfg.N_CLASSES
+IMG_SIZE       = _cfg.IMG_SIZE
+CHANNEL_ORDER  = _cfg.CHANNEL_ORDER
+RANDOM_SEED    = _cfg.RANDOM_SEED
+TEST_SIZE      = _cfg.TEST_SIZE
+VAL_SIZE       = _cfg.VAL_SIZE
 
 
 def parse_ravdess_label(filename):
