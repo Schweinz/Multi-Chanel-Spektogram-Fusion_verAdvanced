@@ -97,6 +97,20 @@ import tensorflow as tf
 # MIXED PRECISION: GPU RAM turun ~40%, training lebih cepat di T4/V100
 # ---------------------------------------------------------------------------
 tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+
+# ---------------------------------------------------------------------------
+# Custom layer pengganti Lambda (agar model bisa di-load tanpa safe_mode=False)
+# Lambda layer diblokir Keras 3 saat deserialisasi karena alasan keamanan.
+# CastToFloat32 adalah custom layer yang aman dan serializable.
+# ---------------------------------------------------------------------------
+class CastToFloat32(tf.keras.layers.Layer):
+    """Cast tensor ke float32. Pengganti Lambda untuk mixed precision output."""
+    def call(self, x):
+        return tf.cast(x, tf.float32)
+
+    def get_config(self):
+        return super().get_config()
 print(f"TensorFlow: {tf.__version__}")
 print(f"GPU: {tf.config.list_physical_devices('GPU')}")
 print(f"Precision: {tf.keras.mixed_precision.global_policy()}")
@@ -394,9 +408,9 @@ def build_model_opsi_c(input_shape=(224, 224, 4), n_classes=8):
     x = tf.keras.layers.Dropout(DROPOUT_RATE, name='head_dropout')(x)
 
     # Cast ke float32 sebelum softmax (wajib untuk mixed precision stability)
-    x = tf.keras.layers.Lambda(
-        lambda t: tf.cast(t, tf.float32), name='cast_fp32'
-    )(x)
+    # Pakai CastToFloat32 layer (bukan Lambda) agar model bisa di-save/load
+    # tanpa error "Lambda deserialization disallowed" di Keras 3
+    x = CastToFloat32(name='cast_fp32')(x)
     outputs = tf.keras.layers.Dense(
         n_classes, activation='softmax', name='predictions',
         dtype='float32'

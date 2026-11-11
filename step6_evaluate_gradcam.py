@@ -63,6 +63,16 @@ import tensorflow as tf
 # Mixed precision harus sama dengan step5
 tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
+
+# Custom layer yang sama dengan step5 -- wajib ada agar load_model berhasil
+class CastToFloat32(tf.keras.layers.Layer):
+    """Cast tensor ke float32. Pengganti Lambda untuk mixed precision output."""
+    def call(self, x):
+        return tf.cast(x, tf.float32)
+
+    def get_config(self):
+        return super().get_config()
+
 BATCH_SIZE = 8   # sama dengan step5
 
 # Local SSD cache (sama dengan step5)
@@ -176,23 +186,41 @@ def load_best_model(condition='B4'):
     """
     Load checkpoint step5 Opsi C.
     Nama file: best_{condition}_opsiC.keras  atau  best_{condition}_opsiC.h5
+
+    Gunakan custom_objects={'CastToFloat32': CastToFloat32} agar layer
+    CastToFloat32 dikenali saat deserialisasi.
+    Kalau model lama masih pakai Lambda, fallback ke safe_mode=False.
     """
+    custom_objs = {'CastToFloat32': CastToFloat32}
+
     keras_path = os.path.join(MODEL_DIR, f"best_{condition}_opsiC.keras")
     h5_path    = os.path.join(MODEL_DIR, f"best_{condition}_opsiC.h5")
 
-    if os.path.exists(keras_path):
-        print(f"Loading: {keras_path}")
-        return tf.keras.models.load_model(keras_path)
-    elif os.path.exists(h5_path):
-        print(f"Loading: {h5_path}")
-        return tf.keras.models.load_model(h5_path)
-    else:
-        raise FileNotFoundError(
-            f"Model {condition} tidak ditemukan.\n"
-            f"  Dicari: {keras_path}\n"
-            f"  Dicari: {h5_path}\n"
-            "Pastikan step5 sudah selesai training."
-        )
+    for path in [keras_path, h5_path]:
+        if not os.path.exists(path):
+            continue
+        print(f"Loading: {path}")
+        # Coba dulu dengan custom_objects (model baru pakai CastToFloat32)
+        try:
+            return tf.keras.models.load_model(path, custom_objects=custom_objs)
+        except Exception as e1:
+            print(f"  [info] Load normal gagal: {e1}")
+            # Fallback: safe_mode=False untuk model lama yang masih pakai Lambda
+            try:
+                print("  [info] Mencoba safe_mode=False (model lama dengan Lambda layer)...")
+                return tf.keras.models.load_model(
+                    path, custom_objects=custom_objs, safe_mode=False
+                )
+            except Exception as e2:
+                print(f"  [error] safe_mode=False juga gagal: {e2}")
+                raise
+
+    raise FileNotFoundError(
+        f"Model {condition} tidak ditemukan.\n"
+        f"  Dicari: {keras_path}\n"
+        f"  Dicari: {h5_path}\n"
+        "Pastikan step5 sudah selesai training."
+    )
 
 
 # ===========================================================================
